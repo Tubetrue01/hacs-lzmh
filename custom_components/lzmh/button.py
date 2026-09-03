@@ -18,7 +18,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """根据 API 返回的门禁动态创建 Button Entity。"""
+    """根据 API 返回的门禁动态创建 Button Entity"""
 
     data = hass.data[DOMAIN][entry.entry_id]
 
@@ -37,7 +37,7 @@ async def async_setup_entry(
 
 
 class HA_DynamicGateButton(ButtonEntity):
-    """动态门禁按钮。"""
+    """动态门禁按钮"""
 
     _attr_has_entity_name = True
 
@@ -46,14 +46,14 @@ class HA_DynamicGateButton(ButtonEntity):
         controller: GateController,
         info: dict[str, Any],
     ) -> None:
-        """初始化按钮。"""
+        """初始化按钮"""
 
         self._controller = controller
         self._info = info
 
-        # --------------------------------------------------------------
+        # ------------------------------
         # Home Assistant Entity 基本信息
-        # --------------------------------------------------------------
+        # ------------------------------
 
         self._attr_name = info["name"]
 
@@ -61,16 +61,16 @@ class HA_DynamicGateButton(ButtonEntity):
             f"{DOMAIN}_{info['unique_id']}"
         )
 
-        # --------------------------------------------------------------
+        # ------------------------------
         # 图标
-        # --------------------------------------------------------------
+        # ------------------------------
 
         if info["action_type"] == "pwd":
             self._attr_icon = "mdi:key-text"
         else:
             self._attr_icon = "mdi:door-closed"
 
-        # --------------------------------------------------------------
+        # ------------------------------
         # 动态状态
         #
         # 例如：
@@ -82,7 +82,7 @@ class HA_DynamicGateButton(ButtonEntity):
         # 开门成功
         #     ↓
         # 点击开门
-        # --------------------------------------------------------------
+        # ------------------------------
 
         self._dynamic_status = info[
             "default_text"
@@ -90,14 +90,14 @@ class HA_DynamicGateButton(ButtonEntity):
 
         self._reset_task: asyncio.Task | None = None
 
-    # ------------------------------------------------------------------
+    # ------------------------------
     # Entity 属性
-    # ------------------------------------------------------------------
+    # ------------------------------
     @property
     def extra_state_attributes(
         self,
     ) -> dict[str, Any]:
-        """返回额外属性。"""
+        """返回额外属性"""
 
         return {
             "dynamic_status": self._dynamic_status,
@@ -108,16 +108,16 @@ class HA_DynamicGateButton(ButtonEntity):
                 else 0
             ),
         }
-    # ------------------------------------------------------------------
+    # ------------------------------
     # 点击按钮
-    # ------------------------------------------------------------------
+    # ------------------------------
 
     async def async_press(self) -> None:
-        """处理按钮点击。"""
+        """处理按钮点击"""
 
-        # --------------------------------------------------------------
+        # ------------------------------
         # 防止连续点击导致多个请求同时执行。
-        # --------------------------------------------------------------
+        # ------------------------------
 
         if self._dynamic_status == "正在操作...":
             _LOGGER.debug(
@@ -126,16 +126,16 @@ class HA_DynamicGateButton(ButtonEntity):
             )
             return
 
-        # --------------------------------------------------------------
+        # ------------------------------
         # 显示 loading
-        # --------------------------------------------------------------
+        # ------------------------------
 
         self._dynamic_status = "正在操作..."
 
         self.async_write_ha_state()
 
         try:
-            # ----------------------------------------------------------
+            # ------------------------------
             # Controller 内部负责：
             #
             # token
@@ -147,7 +147,7 @@ class HA_DynamicGateButton(ButtonEntity):
             # API 重试
             #
             # 这里完全不需要知道这些细节。
-            # ----------------------------------------------------------
+            # ------------------------------
 
             result = await self.hass.async_add_executor_job(
                 self._controller.execute_door_action,
@@ -164,15 +164,15 @@ class HA_DynamicGateButton(ButtonEntity):
 
             self._dynamic_status = "网络异常"
 
-        # --------------------------------------------------------------
+        # ------------------------------
         # 更新 HA 状态
-        # --------------------------------------------------------------
+        # ------------------------------
 
         self.async_write_ha_state()
 
-        # --------------------------------------------------------------
+        # ------------------------------
         # 取消之前的 reset task
-        # --------------------------------------------------------------
+        # ------------------------------
 
         if self._reset_task is not None:
             self._reset_task.cancel()
@@ -181,12 +181,12 @@ class HA_DynamicGateButton(ButtonEntity):
             self._reset_status()
         )
 
-    # ------------------------------------------------------------------
+    # ------------------------------
     # 恢复按钮文字
-    # ------------------------------------------------------------------
+    # ------------------------------
 
     async def _reset_status(self) -> None:
-        """延迟恢复按钮默认状态。"""
+        """延迟恢复按钮默认状态"""
 
         delay = self._info.get(
             "delay",
@@ -205,14 +205,14 @@ class HA_DynamicGateButton(ButtonEntity):
 
         self.async_write_ha_state()
 
-    # ------------------------------------------------------------------
+    # ------------------------------
     # Entity 移除
-    # ------------------------------------------------------------------
+    # ------------------------------
 
     async def async_will_remove_from_hass(
         self,
     ) -> None:
-        """Entity 从 HA 移除时清理 task。"""
+        """Entity 从 HA 移除时清理 task"""
 
         if self._reset_task is not None:
             self._reset_task.cancel()
