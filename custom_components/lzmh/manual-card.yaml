@@ -1,0 +1,249 @@
+type: custom:auto-entities
+card:
+  type: grid
+  columns: 2
+  square: false
+  title: 门禁
+card_param: cards
+filter:
+  include:
+    - integration: lzmh
+      domain: button
+      options:
+        type: custom:button-card
+        entity: this.entity_id
+        show_icon: true
+        show_name: true
+        show_label: true
+        icon: |
+          [[[
+            const gateType = String(
+              entity?.attributes?.gate_type || ''
+            );
+
+            const status = String(
+              entity?.attributes?.dynamic_status ||
+              entity?.state ||
+              ''
+            );
+
+            // 正在操作
+            if (status === '正在操作...') {
+              return 'mdi:loading';
+            }
+
+            // 操作失败
+            if (status.includes('失败')) {
+              return 'mdi:lock-alert';
+            }
+
+            // 获取临时密码
+            if (gateType === 'pwd') {
+              return 'mdi:key-star';
+            }
+
+            // 开门成功
+            if (
+              status === '开门成功' ||
+              status === '开锁成功'
+            ) {
+              return 'mdi:door-open';
+            }
+
+            // 普通门禁
+            return 'mdi:door-closed';
+          ]]]
+        name: |
+          [[[
+            return String(
+              entity?.attributes?.dynamic_status ||
+              entity?.state ||
+              '点击操作'
+            );
+          ]]]
+        label: |
+          [[[
+            return (
+              entity?.attributes?.friendly_name ||
+              entity?.name ||
+              ''
+            );
+          ]]]
+        styles:
+          grid:
+            - grid-template-areas: '"i" "n" "l"'
+            - grid-template-rows: 1fr min-content min-content
+            - grid-template-columns: 1fr
+          card:
+            - height: 110px
+            - border-radius: 12px
+            - transition: all 0.5s ease
+            - background-color: |
+                [[[
+                  const status = String(
+                    entity?.attributes?.dynamic_status ||
+                    entity?.state ||
+                    ''
+                  );
+
+                  const gateType = String(
+                    entity?.attributes?.gate_type ||
+                    ''
+                  );
+
+                  // 密码门禁
+                  if (gateType === 'pwd') {
+
+                    // 获取失败
+                    if (status.includes('失败')) {
+                      return '#c62828';
+                    }
+
+                    // 已经获取到密码 / 操作完成
+                    if (
+                      status &&
+                      status !== '获取临时密码'
+                    ) {
+                      return '#2e7d32';
+                    }
+
+                    // 默认
+                    return '#1E90FF';
+                  }
+
+                  // 普通门禁：开门成功
+                  if (
+                    status === '开门成功' ||
+                    status === '开锁成功'
+                  ) {
+                    return '#2e7d32';
+                  }
+
+                  // 普通门禁：失败
+                  if (status.includes('失败')) {
+                    return '#c62828';
+                  }
+
+                  // 默认背景
+                  return 'var(--ha-card-background, var(--card-background-color))';
+                ]]]
+          icon:
+            - width: 32px
+            - height: 32px
+            - justify-self: center
+            - align-self: center
+            - opacity: 1 !important
+            - color: |
+                [[[
+                  const status = String(
+                    entity?.attributes?.dynamic_status ||
+                    entity?.state ||
+                    ''
+                  );
+
+                  const gateType = String(
+                    entity?.attributes?.gate_type ||
+                    ''
+                  );
+
+                  // 密码门禁
+                  if (gateType === 'pwd') {
+                    return '#ffffff';
+                  }
+
+                  // 成功 / 失败
+                  if (
+                    status === '开门成功' ||
+                    status === '开锁成功' ||
+                    status.includes('失败')
+                  ) {
+                    return '#ffffff';
+                  }
+
+                  return 'var(--paper-item-icon-color)';
+                ]]]
+            - animation: |
+                [[[
+                  const status = String(
+                    entity?.attributes?.dynamic_status ||
+                    entity?.state ||
+                    ''
+                  );
+
+                  if (status === '正在操作...') {
+                    return 'rotation 1s linear infinite';
+                  }
+
+                  return 'none';
+                ]]]
+          name:
+            - font-size: 14px
+            - font-weight: bold
+            - color: |
+                [[[
+                  const status = String(
+                    entity?.attributes?.dynamic_status ||
+                    entity?.state ||
+                    ''
+                  );
+
+                  const gateType = String(
+                    entity?.attributes?.gate_type ||
+                    ''
+                  );
+
+                  if (
+                    gateType === 'pwd' ||
+                    status === '开门成功' ||
+                    status === '开锁成功' ||
+                    status.includes('失败')
+                  ) {
+                    return '#ffffff';
+                  }
+
+                  return 'var(--primary-text-color)';
+                ]]]
+          label:
+            - font-size: 11px
+            - color: |
+                [[[
+                  const status = String(
+                    entity?.attributes?.dynamic_status ||
+                    entity?.state ||
+                    ''
+                  );
+
+                  const gateType = String(
+                    entity?.attributes?.gate_type ||
+                    ''
+                  );
+
+                  if (
+                    gateType === 'pwd' ||
+                    status === '开门成功' ||
+                    status === '开锁成功' ||
+                    status.includes('失败')
+                  ) {
+                    return '#e0e0e0';
+                  }
+
+                  return 'var(--secondary-text-color)';
+                ]]]
+        extra_styles: |
+          @keyframes rotation {
+            0% {
+              transform: rotate(0deg);
+            }
+
+            100% {
+              transform: rotate(360deg);
+            }
+          }
+        tap_action:
+          action: call-service
+          service: button.press
+          target:
+            entity_id: this.entity_id
+sort:
+  method: attribute
+  attribute: sort_order

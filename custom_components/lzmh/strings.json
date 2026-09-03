@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "联掌门户",
+        "description": "请输入联掌门户账号和密码",
+        "data": {
+          "phone": "手机号",
+          "password": "密码"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "登录失败，请检查手机号和密码",
+      "invalid_phone": "请输入手机号",
+      "invalid_password": "请输入密码"
+    },
+    "abort": {
+      "already_configured": "联掌门户已经配置"
+    }
+  }
+}
