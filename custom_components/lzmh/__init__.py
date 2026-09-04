@@ -2,9 +2,11 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 
 from .api import GateController
-from .const import DOMAIN
+from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,28 +24,21 @@ async def async_setup_entry(
         _LOGGER.error("缺少手机号或密码配置")
         return False
 
-    # 单用户模式：整个集成共用一个 session 文件。
-    cache_file = hass.config.path(
-        ".storage",
-        f"{DOMAIN}_session.json",
-    )
+    store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+
+    session = async_get_clientsession(hass)
 
     controller = GateController(
         phone=phone,
         password=password,
-        cache_file=cache_file,
+        session=session,
+        store=store,
     )
 
-    # load_session() 使用同步文件 I/O，
-    await hass.async_add_executor_job(
-        controller.load_session
-    )
+    await controller.async_load_session()
 
     try:
-        # fetch_and_clean_doors() 内部包含 requests
-        doors = await hass.async_add_executor_job(
-            controller.fetch_and_clean_doors
-        )
+        doors = await controller.async_fetch_and_clean_doors()
     except Exception:
         _LOGGER.exception("初始化联掌门户失败")
         return False
@@ -51,9 +46,7 @@ async def async_setup_entry(
     if not doors:
         _LOGGER.warning("没有获取到任何门禁设备")
 
-    hass.data.setdefault(DOMAIN, {})[
-        entry.entry_id
-    ] = {
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "controller": controller,
         "doors": doors,
     }

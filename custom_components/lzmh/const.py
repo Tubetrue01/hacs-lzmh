@@ -4,6 +4,9 @@ DEV_NAME = "/lzmh_app_api"
 OPEN_DOOR_V2_SECRET = "lzmh@openDoor#v2"
 API_SUCCESS_CODE = 10000
 
+STORAGE_VERSION = 1
+STORAGE_KEY = f"{DOMAIN}_session"
+
 COMMON_HEADER_BODY = {
     "imei": "865123001234567",
     "andModel": "Redmi Note 12 Pro",

@@ -1,11 +1,11 @@
+import functools
 import hashlib
-import json
 import logging
-import os
 import time
 from typing import Any
 
-import requests
+from aiohttp import ClientError, ClientResponseError, ClientSession
+from homeassistant.helpers.storage import Store
 
 from .const import API_SUCCESS_CODE, DEV_NAME, OLD_BASE
 
@@ -22,6 +22,28 @@ HEADERS = {
 OPEN_DOOR_SECRET = "lzmh@openDoor#v2"
 
 
+def auto_relogin(func):
+    """自动登录与 Token 失效重试装饰器"""
+
+    @functools.wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        if not self.token or not self.openid:
+            _LOGGER.info("内存缺少 Token，自动触发网络登录...")
+            if not await self.async_force_refresh_token():
+                return {}
+
+        res_json = await func(self, *args, **kwargs)
+
+        if not res_json or res_json.get("code") != API_SUCCESS_CODE:
+            _LOGGER.warning("Token 可能失效或响应异常，尝试重新登录重试...")
+            if await self.async_force_refresh_token():
+                res_json = await func(self, *args, **kwargs)
+
+        return res_json or {}
+
+    return wrapper
+
+
 class GateController:
     """联掌门户 API 控制器"""
 
@@ -29,50 +51,34 @@ class GateController:
             self,
             phone: str,
             password: str,
-            cache_file: str,
+            session: ClientSession,
+            store: Store,
     ) -> None:
         self.phone = phone
         self.password = password
 
+        self.store = store
+        self.session = session
+
         self.token: str | None = None
         self.openid: str | None = None
-
-        self.cache_file = cache_file
 
     # -----------------
     # 基础工具
     # -----------------
 
     @staticmethod
-    def calc_md5(value: str) -> str:
+    def _calc_md5(value: str) -> str:
         """计算 MD5"""
+        return hashlib.md5(value.encode("utf-8")).hexdigest()
 
-        return hashlib.md5(
-            value.encode("utf-8")
-        ).hexdigest()
-
-    # -----------------
-    # 登录
-    # -----------------
-
-    def login(self) -> requests.Response:
-        """登录并获取 token/openid"""
-
+    async def _async_login(self) -> dict[str, Any]:
+        """登录 API，获取原始响应数据"""
         login_path = "/api/v2/login/account"
-
         login_t = int(time.time())
 
-        login_sign = self.calc_md5(
-            f"{login_path}{login_t}"
-        )
-
-        pwd_md5 = self.calc_md5(
-            self.password
-        )
-
-        login_url = (
-            f"{OLD_BASE}{DEV_NAME}{login_path}"
-        )
+        login_sign = self._calc_md5(f"{login_path}{login_t}")
+        pwd_md5 = self._calc_md5(self.password)
 
         params = {
             "t": login_t,
@@ -103,88 +109,49 @@ class GateController:
             },
         }
 
-        _LOGGER.info(
-            "正在登录联掌门户: %s",
-            login_url,
-        )
+        _LOGGER.info("正在登录联掌门户...")
 
-        response = requests.post(
-            login_url,
+        return await self._post(
+            path=login_path,
             params=params,
-            headers=HEADERS,
-            json=login_body,
-            timeout=(10, 15),
+            body=login_body,
         )
 
-        _LOGGER.debug(
-            "登录 HTTP %s: %s",
-            response.status_code,
-            response.text[:1000],
-        )
-
-        response.raise_for_status()
-
-        return response
-
-    def force_refresh_token(self) -> bool:
-        """重新登录并刷新 token"""
-
+    async def async_force_refresh_token(self) -> bool:
+        """强制重新登录并刷新/保存 Session（异步）"""
         try:
-            response = self.login()
-
-            res_json = response.json()
+            res_json = await self._async_login()
 
             if res_json.get("code") != API_SUCCESS_CODE:
                 _LOGGER.error(
                     "登录失败: code=%s, response=%s",
                     res_json.get("code"),
-                    response.text[:1000],
+                    res_json,
                 )
                 return False
 
             value = res_json.get("value") or {}
-
             token = value.get("token")
             openid = value.get("openid")
 
             if not token or not openid:
-                _LOGGER.error(
-                    "登录成功但没有获取到 token/openid: %s",
-                    response.text[:1000],
-                )
+                _LOGGER.error("登录成功但响应中缺少 token/openid: %s", res_json)
                 return False
 
             self.token = token
             self.openid = openid
 
-            self.save_session()
+            await self.async_save_session()
 
-            _LOGGER.info(
-                "联掌门户登录成功，session 已保存"
-            )
-
+            _LOGGER.info("联掌门户登录成功，Session 已持久化保存")
             return True
 
-        except requests.exceptions.Timeout:
-            _LOGGER.error(
-                "登录请求超时，请检查服务器地址和网络连接"
-            )
-
-        except requests.exceptions.ConnectionError as err:
-            _LOGGER.error(
-                "登录服务器无法连接: %s",
-                err,
-            )
-
-        except (
-                requests.exceptions.RequestException,
-                ValueError,
-                OSError,
-        ) as err:
-            _LOGGER.error(
-                "登录失败: %s",
-                err,
-            )
+        except TimeoutError:
+            _LOGGER.error("登录请求超时，请检查网络连接或服务器地址")
+        except ClientError as err:
+            _LOGGER.error("登录服务器连接失败: %s", err)
+        except Exception as err:
+            _LOGGER.exception("登录过程发生未预期异常: %s", err)
 
         return False
 
@@ -192,26 +159,14 @@ class GateController:
     # Session
     # -----------------
 
-    def load_session(self) -> None:
-        """加载保存的 token/openid"""
-
-        if not self.cache_file:
-            return
-
-        if not os.path.exists(self.cache_file):
-            _LOGGER.debug(
-                "session 文件不存在: %s",
-                self.cache_file,
-            )
-            return
-
+    async def async_load_session(self) -> None:
+        """加载保存的 token/openid (异步)"""
         try:
-            with open(
-                    self.cache_file,
-                    "r",
-                    encoding="utf-8",
-            ) as file:
-                data = json.load(file)
+            data = await self.store.async_load()
+
+            if not data:
+                _LOGGER.debug("Session 文件不存在或为空")
+                return
 
             token = data.get("token")
             openid = data.get("openid")
@@ -219,146 +174,77 @@ class GateController:
             if token and openid:
                 self.token = token
                 self.openid = openid
-
-                _LOGGER.debug(
-                    "已加载联掌门户 session"
-                )
+                _LOGGER.debug("已成功加载联掌门户 Session")
             else:
-                _LOGGER.warning(
-                    "session 文件存在，但缺少 token/openid"
-                )
+                _LOGGER.warning("Session 文件存在，但缺少 token/openid")
 
-        except (
-                OSError,
-                ValueError,
-                TypeError,
-        ) as err:
-            _LOGGER.warning(
-                "读取 session 失败: %s",
-                err,
-            )
+        except Exception as err:
+            _LOGGER.warning("读取 Session 失败: %s", err)
 
-    def save_session(self) -> None:
-        """保存 token/openid"""
-
-        if not self.cache_file:
-            return
-
+    async def async_save_session(self) -> None:
+        """保存 token/openid (异步)"""
         if not self.token or not self.openid:
-            _LOGGER.warning(
-                "没有 token/openid，不保存 session"
-            )
+            _LOGGER.warning("没有 token/openid，不保存 Session")
             return
-
-        directory = os.path.dirname(
-            self.cache_file
-        )
-
-        if directory:
-            try:
-                os.makedirs(
-                    directory,
-                    exist_ok=True,
-                )
-            except OSError as err:
-                _LOGGER.error(
-                    "创建 session 目录失败: %s",
-                    err,
-                )
-                return
 
         data = {
             "token": self.token,
             "openid": self.openid,
         }
 
-        temp_file = f"{self.cache_file}.tmp"
-
         try:
-            with open(
-                    temp_file,
-                    "w",
-                    encoding="utf-8",
-            ) as file:
-                json.dump(
-                    data,
-                    file,
-                    ensure_ascii=False,
-                )
+            await self.store.async_save(data)
+            _LOGGER.debug("Session 已保存")
 
-            # 原子替换。
-            os.replace(
-                temp_file,
-                self.cache_file,
-            )
-
-            _LOGGER.debug(
-                "session 已保存"
-            )
-
-        except OSError as err:
-            _LOGGER.error(
-                "保存 session 失败: %s",
-                err,
-            )
-
-            # 如果临时文件已经创建但 replace 失败，
-            # 尝试清理临时文件。
-            try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-            except OSError:
-                pass
+        except Exception as err:
+            _LOGGER.error("保存 Session 失败: %s", err)
 
     # -----------------
     # HTTP
     # -----------------
 
-    def _post(
+    async def _post(
             self,
             path: str,
-            params: dict[str, Any],
-            body: dict[str, Any],
-    ) -> requests.Response:
-
+            params: dict[str, Any] | None = None,
+            body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """底层的异步 POST 请求封装"""
         url = f"{OLD_BASE}{DEV_NAME}{path}"
 
-        response = requests.post(
-            url,
-            params=params,
-            headers=HEADERS,
-            json=body,
-            timeout=(10, 15),
-        )
+        try:
+            async with self.session.post(
+                    url,
+                    params=params,
+                    headers=HEADERS,
+                    json=body,
+                    timeout=15,
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+                return data
 
-        response.raise_for_status()
-
-        return response
+        except ClientResponseError as err:
+            _LOGGER.error("HTTP 错误 (%s): %s", err.status, err.message)
+            raise
+        except ClientError as err:
+            _LOGGER.error("网络连接或请求失败: %s", err)
+            raise
+        except TimeoutError:
+            _LOGGER.error("请求超时: %s", url)
+            raise
 
     # -----------------
-    # 小区列表
+    # 小区列表 (底层返回 Raw Dict)
     # -----------------
 
-    def get_my_community_list(
-            self,
-    ) -> requests.Response:
-        """获取我的小区及门禁列表。"""
-
-        if not self.token or not self.openid:
-            raise RuntimeError(
-                "缺少 token/openid"
-            )
-
-        path = (
-            "/api/v1/community/"
-            "getMyCommunityList"
-        )
-
+    @auto_relogin
+    async def async_get_my_community_list(self) -> dict[str, Any]:
+        """获取我的小区及门禁列表"""
+        path = "/api/v1/community/getMyCommunityList"
         timestamp = int(time.time())
 
-        sign = self.calc_md5(
-            f"{path}{timestamp}{self.token}"
-        )
+        sign = self._calc_md5(f"{path}{timestamp}{self.token}")
 
         params = {
             "timestamp": timestamp,
@@ -383,44 +269,32 @@ class GateController:
             "body": {},
         }
 
-        return self._post(
+        return await self._post(
             path=path,
             params=params,
             body=body,
         )
 
     # -----------------
-    # 开门
+    # 开门 (底层 Raw 请求 -> 业务层 bool 封装)
     # -----------------
 
-    def open_door(
+    @auto_relogin
+    async def _async_raw_open_door(
             self,
             door_sn: str,
             door_eqmodel: int = 6,
-    ) -> requests.Response:
-        """执行开门操作。"""
-
-        if not self.token or not self.openid:
-            raise RuntimeError(
-                "缺少 token/openid"
-            )
-
+    ) -> dict[str, Any]:
+        """开门底层裸接口（供装饰器捕获 Code 使用）"""
         if door_eqmodel == 8:
-            path = (
-                "/api/v1/opendoor/"
-                "openDoorControlByOrion"
-            )
+            path = "/api/v1/opendoor/openDoorControlByOrion"
         else:
-            path = (
-                "/api/v1/opendoor/"
-                "openDoorControlV2"
-            )
+            path = "/api/v1/opendoor/openDoorControlV2"
 
         timestamp = int(time.time())
-
         msg_id = str(timestamp)
 
-        sign = self.calc_md5(
+        sign = self._calc_md5(
             f"{path}"
             f"{door_sn}"
             f"{msg_id}"
@@ -455,37 +329,43 @@ class GateController:
             },
         }
 
-        return self._post(
+        return await self._post(
             path=path,
             params=params,
             body=body,
         )
 
-    # -----------------
-    # 临时密码
-    # -----------------
-
-    def open_door_pwd(
+    async def async_open_door(
             self,
-            door_bt_mac: str,
-    ) -> requests.Response:
-        """获取门禁临时密码。"""
-
-        if not self.token or not self.openid:
-            raise RuntimeError(
-                "缺少 token/openid"
-            )
-
-        path = (
-            "/api/v1/opendoor/"
-            "getOpenDoorPwd"
+            door_sn: str,
+            door_eqmodel: int = 6,
+    ) -> bool:
+        """执行开门操作（面向 Button 实体的上层接口）"""
+        res_data = await self._async_raw_open_door(
+            door_sn=door_sn, door_eqmodel=door_eqmodel
         )
 
+        code = res_data.get("code")
+        if code == API_SUCCESS_CODE:
+            _LOGGER.info("设备 [%s] 开门成功", door_sn)
+            return True
+
+        _LOGGER.error("设备 [%s] 开门失败，响应信息: %s", door_sn, res_data)
+        return False
+
+    # -----------------
+    # 临时密码 (底层 Raw 请求 -> 业务层 str 封装)
+    # -----------------
+
+    @auto_relogin
+    async def _async_raw_get_open_door_pwd(
+            self, door_bt_mac: str
+    ) -> dict[str, Any]:
+        """获取临时密码底层裸接口"""
+        path = "/api/v1/opendoor/getOpenDoorPwd"
         timestamp = int(time.time())
 
-        sign = self.calc_md5(
-            f"{path}{timestamp}{self.token}"
-        )
+        sign = self._calc_md5(f"{path}{timestamp}{self.token}")
 
         params = {
             "timestamp": timestamp,
@@ -512,382 +392,88 @@ class GateController:
             },
         }
 
-        return self._post(
+        return await self._post(
             path=path,
             params=params,
             body=body,
         )
 
-    # -----------------
-    # 统一门禁操作
-    # -----------------
-
-    def execute_door_action(
+    async def async_get_open_door_pwd(
             self,
-            door_info: dict[str, Any],
-    ) -> str:
-        """执行门禁操作"""
-
-        action_type = door_info.get(
-            "action_type"
+            door_bt_mac: str,
+    ) -> str | None:
+        """获取门禁临时密码（面向 Button 实体的上层接口）"""
+        res_data = await self._async_raw_get_open_door_pwd(
+            door_bt_mac=door_bt_mac
         )
 
-        # -----------------
-        # 第一次请求
-        # -----------------
+        if res_data.get("code") == API_SUCCESS_CODE:
+            pwd = res_data.get("value")
+            if pwd:
+                _LOGGER.info("成功获取设备 [%s] 的开门密码: %s", door_bt_mac, pwd)
+                return str(pwd)
 
-        try:
-            response = self._execute_door_action_once(
-                door_info
-            )
-
-            res_json = response.json()
-
-        except (
-                requests.exceptions.RequestException,
-        ) as err:
-            _LOGGER.error(
-                "门禁 API 请求失败: %s",
-                err,
-            )
-            return "网络异常"
-
-        except ValueError:
-            _LOGGER.error(
-                "门禁 API 返回非 JSON: %s",
-                response.text[:1000],
-            )
-            return "操作失败"
-
-        if res_json.get("code") == API_SUCCESS_CODE:
-            return self._parse_action_result(
-                action_type,
-                res_json,
-            )
-
-        # -----------------
-        # 第一次失败：
-        # 很可能 token 失效，重新登录一次
-        # -----------------
-
-        _LOGGER.warning(
-            "门禁 API 返回失败 code=%s，"
-            "尝试重新登录后重试",
-            res_json.get("code"),
-        )
-
-        if not self.force_refresh_token():
-            return "登录失效"
-
-        # -----------------
-        # 第二次请求
-        # -----------------
-
-        try:
-            response = self._execute_door_action_once(
-                door_info
-            )
-
-            res_json = response.json()
-
-        except requests.exceptions.RequestException as err:
-            _LOGGER.error(
-                "刷新 session 后再次请求失败: %s",
-                err,
-            )
-            return "网络异常"
-
-        except ValueError:
-            _LOGGER.error(
-                "刷新 session 后 API 返回非 JSON: %s",
-                response.text[:1000],
-            )
-            return "操作失败"
-
-        if res_json.get("code") != API_SUCCESS_CODE:
-            _LOGGER.error(
-                "门禁操作失败: code=%s, message=%s",
-                res_json.get("code"),
-                res_json.get("message"),
-            )
-            return "操作失败"
-
-        return self._parse_action_result(
-            action_type,
-            res_json,
-        )
-
-    def _execute_door_action_once(
-            self,
-            door_info: dict[str, Any],
-    ) -> requests.Response:
-        """执行一次门禁操作，不处理 token 刷新"""
-
-        action_type = door_info.get(
-            "action_type"
-        )
-
-        target = door_info.get(
-            "target"
-        )
-
-        if action_type == "open":
-            eq_model = door_info.get(
-                "eq_model",
-                6,
-            )
-
-            try:
-                eq_model = int(eq_model)
-            except (
-                    TypeError,
-                    ValueError,
-            ):
-                eq_model = 6
-
-            return self.open_door(
-                door_sn=target,
-                door_eqmodel=eq_model,
-            )
-
-        if action_type == "pwd":
-            return self.open_door_pwd(
-                door_bt_mac=target,
-            )
-
-        raise ValueError(
-            f"未知门禁 action_type: {action_type}"
-        )
-
-    @staticmethod
-    def _parse_action_result(
-            action_type: str | None,
-            res_json: dict[str, Any],
-    ) -> str:
-        """解析门禁 API 成功结果。"""
-
-        if action_type == "pwd":
-            value = res_json.get("value")
-
-            if value is None:
-                return "获取成功"
-
-            return str(value)
-
-        return "开门成功"
+        _LOGGER.error("获取设备 [%s] 开门密码失败: %s", door_bt_mac, res_data)
+        return None
 
     # -----------------
     # 获取动态门禁
     # -----------------
 
-    def fetch_and_clean_doors(
-            self,
-    ) -> list[dict[str, Any]]:
-        """获取并整理门禁设备"""
+    async def async_fetch_and_clean_doors(self) -> list[dict[str, Any]]:
+        """获取并整理门禁设备（异步极简版）"""
+        res_json = await self.async_get_my_community_list()
 
-        # -----------------
-        # 没有 session，先登录
-        # -----------------
-
-        if not self.token or not self.openid:
-            _LOGGER.info(
-                "没有有效 session，开始登录"
-            )
-
-            if not self.force_refresh_token():
-                _LOGGER.error(
-                    "自动登录失败"
-                )
-                return []
-
-        # -----------------
-        # 第一次获取门禁列表
-        # -----------------
-
-        try:
-            response = self.get_my_community_list()
-
-            res_json = response.json()
-
-        except requests.exceptions.RequestException as err:
-            _LOGGER.error(
-                "获取门禁列表失败: %s",
-                err,
-            )
+        if not res_json or res_json.get("code") != API_SUCCESS_CODE:
+            _LOGGER.error("获取门禁列表失败或数据格式异常: %s", res_json)
             return []
-
-        except ValueError:
-            _LOGGER.error(
-                "获取门禁列表返回非 JSON: %s",
-                response.text[:1000],
-            )
-            return []
-
-        # -----------------
-        # token 可能已经失效
-        # -----------------
-
-        if res_json.get("code") != API_SUCCESS_CODE:
-            _LOGGER.warning(
-                "获取门禁列表失败: code=%s，"
-                "尝试重新登录",
-                res_json.get("code"),
-            )
-
-            if not self.force_refresh_token():
-                return []
-
-            try:
-                response = self.get_my_community_list()
-
-                res_json = response.json()
-
-            except requests.exceptions.RequestException as err:
-                _LOGGER.error(
-                    "重新登录后获取门禁列表失败: %s",
-                    err,
-                )
-                return []
-
-            except ValueError:
-                _LOGGER.error(
-                    "重新登录后门禁列表返回非 JSON: %s",
-                    response.text[:1000],
-                )
-                return []
-
-            if res_json.get("code") != API_SUCCESS_CODE:
-                _LOGGER.error(
-                    "重新登录后获取门禁列表仍失败: "
-                    "code=%s, message=%s",
-                    res_json.get("code"),
-                    res_json.get("message"),
-                )
-                return []
-
-        # -----------------
-        # 解析门禁
-        # -----------------
 
         value = res_json.get("value") or {}
-
-        com_list = value.get(
-            "comList"
-        ) or []
-
-        doors_pool: list[
-            dict[str, Any]
-        ] = []
+        com_list = value.get("comList") or []
+        doors_pool: list[dict[str, Any]] = []
 
         for community in com_list:
-            # ==================
-            # 普通门禁
-            # ==================
-
-            equ_list = community.get(
-                "equ_list"
-            ) or []
-
-            for equ in equ_list:
-                eq_model = equ.get(
-                    "eq_model",
-                    6,
-                )
+            # 1. 普通门禁 (一键开门)
+            for equ in community.get("equ_list") or []:
+                ser_num = equ.get("ser_num", "")
+                if not ser_num:
+                    _LOGGER.warning("跳过普通门禁，缺少 ser_num: %s", equ)
+                    continue
 
                 try:
-                    eq_model = int(eq_model)
-                except (
-                        TypeError,
-                        ValueError,
-                ):
+                    eq_model = int(equ.get("eq_model", 6))
+                except (TypeError, ValueError):
                     eq_model = 6
 
-                ser_num = equ.get(
-                    "ser_num",
-                    "",
-                )
+                unique_id = equ.get("id") or ser_num
 
-                unique_id = (
-                        equ.get("id")
-                        or ser_num
-                )
+                doors_pool.append({
+                    "name": equ.get("door_no") or equ.get("name") or "常规门禁",
+                    "action_type": "open",
+                    "target": ser_num,
+                    "eq_model": eq_model,
+                    "delay": 2,
+                    "default_text": "点击开门",
+                    "unique_id": f"gate_equ_{unique_id}",
+                })
 
-                if not ser_num:
-                    _LOGGER.warning(
-                        "跳过普通门禁，"
-                        "缺少 ser_num: %s",
-                        equ,
-                    )
-                    continue
-
-                doors_pool.append(
-                    {
-                        "name": (
-                                equ.get("door_no")
-                                or equ.get("name")
-                                or "常规门禁"
-                        ),
-                        "action_type": "open",
-                        "target": ser_num,
-                        "eq_model": eq_model,
-                        "delay": 2,
-                        "default_text": "点击开门",
-                        "unique_id": (
-                            f"gate_equ_{unique_id}"
-                        ),
-                    }
-                )
-
-            # ==================
-            # 独立门禁 / 临时密码
-            # ==================
-
-            alone_list = community.get(
-                "alone_list"
-            ) or []
-
-            for alone in alone_list:
-                bt_mac = alone.get(
-                    "bt_mac",
-                    "",
-                )
-
-                unique_id = (
-                        alone.get("id")
-                        or bt_mac
-                )
-
+            # 2. 独立门禁 / 临时密码
+            for alone in community.get("alone_list") or []:
+                bt_mac = alone.get("bt_mac", "")
                 if not bt_mac:
-                    _LOGGER.warning(
-                        "跳过独立门禁，"
-                        "缺少 bt_mac: %s",
-                        alone,
-                    )
+                    _LOGGER.warning("跳过独立门禁，缺少 bt_mac: %s", alone)
                     continue
 
-                doors_pool.append(
-                    {
-                        "name": (
-                                alone.get(
-                                    "pos_name"
-                                )
-                                or "独立门禁"
-                        ),
-                        "action_type": "pwd",
-                        "target": bt_mac,
-                        "delay": 5,
-                        "default_text": (
-                            "获取临时密码"
-                        ),
-                        "unique_id": (
-                            f"gate_alone_{unique_id}"
-                        ),
-                    }
-                )
+                unique_id = alone.get("id") or bt_mac
 
-        _LOGGER.info(
-            "获取到 %d 个门禁设备",
-            len(doors_pool),
-        )
+                doors_pool.append({
+                    "name": alone.get("pos_name") or "独立门禁",
+                    "action_type": "pwd",
+                    "target": bt_mac,
+                    "delay": 5,
+                    "default_text": "获取临时密码",
+                    "unique_id": f"gate_alone_{unique_id}",
+                })
 
+        _LOGGER.info("成功解析到 %d 个门禁设备", len(doors_pool))
         return doors_pool
